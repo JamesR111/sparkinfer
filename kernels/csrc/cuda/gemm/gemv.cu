@@ -2455,6 +2455,18 @@ template __global__ void si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 16>(const si_
 #ifndef _MSC_VER
 template __global__ void si_mmvq_q4k_dualrow_kernel<float, 16>(const si_block_q8_1*, const unsigned char*, float*, int);
 #endif
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 20>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+#endif
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_dualrow_kernel<float, 20>(const si_block_q8_1*, const unsigned char*, float*, int);
+#endif
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 26>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+#endif
+#ifndef _MSC_VER
+template __global__ void si_mmvq_q4k_dualrow_kernel<float, 26>(const si_block_q8_1*, const unsigned char*, float*, int);
+#endif
 // Full-attn decode: Q+K+V Q4_K projections from one block_q8_1 activation in one grid.
 template <typename OutT, int NSUPER>
 __global__ void si_attn_qkv_mmvq_q4k_kernel(
@@ -3937,6 +3949,26 @@ static int mmvq_dualrow() {
     if (v < 0) { const char* e = getenv("SPARKINFER_MMVQ2"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
+// Super-block count the dual-row kernel is instantiated for, or 0 to keep kfixed.
+// Dual-row was wired only for Qwen3.6's K=2048. The kernel itself is NSUPER-templated
+// (same row_tid striping as kfixed). Qwen3.8-27B's Q4_K lm_head is 248320 x 5120
+// and is the only Q4_K GEMV on that decode step; Muse's is 202048 x 6656. Same
+// occupancy lever, same N>=512 floor so a tiny projection stays on one-row kfixed.
+// K=4096 stays on kfixed: dual-row there was measured sub-kfixed even after the
+// row_tid striping fix. SPARKINFER_MMVQ2_WIDE=0 restores the previous dispatch
+// (dual-row only at K=2048). SPARKINFER_MMVQ2=0 still kills dual-row everywhere.
+static int mmvq_dualrow_ns(int N, int K) {
+    if (N < 512) return 0;
+    if (K == 2048) return mmvq_dualrow() ? 8 : 0;
+    static const bool wide = [] {
+        const char* e = getenv("SPARKINFER_MMVQ2_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    if (!wide || !mmvq_dualrow()) return 0;
+    if (K == 5120) return 20;
+    if (K == 6656) return 26;
+    return 0;
+}
 bool launch_mmvq_q4k_kfixed2(const void* q81, const void* W0, const void* W1,
                              void* y0, void* y1, int N0, int N1, int K, cudaStream_t stream) {
     if (K != 6656 || N0 <= 0 || N1 <= 0) return false;   // Muse Glimmer's hidden size only
@@ -3951,10 +3983,15 @@ void launch_mmvq_q4k(const void* q81, const void* W, void* y, int N, int K, cuda
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
     __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(y);
-    // Dual-row validated for Qwen3.6 (K=2048); K=4096 row_tid fix lands but accuracy still sub-kfixed.
-    const int dual = mmvq_dualrow() && K == 2048 && N >= 512;
-    if (dual)
+    const int dual_ns = mmvq_dualrow_ns(N, K);
+    if (dual_ns == 8)
         si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 8><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, out, N);
+    else if (dual_ns == 16)
+        si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 16><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, out, N);
+    else if (dual_ns == 20)
+        si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 20><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, out, N);
+    else if (dual_ns == 26)
+        si_mmvq_q4k_dualrow_kernel<__nv_bfloat16, 26><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, out, N);
     else if (K == 2048) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 8><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<__nv_bfloat16, 16><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
     // Muse Glimmer's hidden size. Its q/gate/k/v projections were the only hot GEMVs left on the
@@ -4004,9 +4041,15 @@ void launch_mmvq_q4k_sigmoid(const void* q81, const void* W, float* out, int K, 
 void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
-    const int dual = mmvq_dualrow() && K == 2048 && N >= 512;
-    if (dual)
+    const int dual_ns = mmvq_dualrow_ns(N, K);
+    if (dual_ns == 8)
         si_mmvq_q4k_dualrow_kernel<float, 8><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, y, N);
+    else if (dual_ns == 16)
+        si_mmvq_q4k_dualrow_kernel<float, 16><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, y, N);
+    else if (dual_ns == 20)
+        si_mmvq_q4k_dualrow_kernel<float, 20><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, y, N);
+    else if (dual_ns == 26)
+        si_mmvq_q4k_dualrow_kernel<float, 26><<<(N + 1) / 2, 8 * 32, 0, stream>>>(q, w, y, N);
     else if (K == 2048)      si_mmvq_q4k_kfixed_kernel<float, 8><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else if (K == 4096) si_mmvq_q4k_kfixed_kernel<float, 16><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
     else if (K == 5120) si_mmvq_q4k_kfixed_kernel<float, 20><<<N, 4 * 32, 0, stream>>>(q, w, y, N);

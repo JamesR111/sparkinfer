@@ -1271,6 +1271,11 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         const char* e = getenv("SPARKINFER_FAMMA4");
         famma4_graph = (e && e[0] == '0') ? 0 : 1;
     }
+    static int famma6_graph = -1;
+    if (famma6_graph < 0) {
+        const char* e = getenv("SPARKINFER_FAMMA6");
+        famma6_graph = (e && e[0] == '0') ? 0 : 1;
+    }
     int attn_graph_mode = 0;
     if (famma_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
         c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 8) {
@@ -1280,6 +1285,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 4) {
         const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
         attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 3 : 1;
+    } else if (famma6_graph && s.kv->int8_kv() && s.kv->block_size() == 16 &&
+               c.n_kv_heads > 0 && c.n_q_heads == c.n_kv_heads * 6) {
+        // The 8:1 and 4:1 groups recapture when the host launcher switches scalar -> MMA.
+        // The 6:1 group (Qwen3.8-27B's 24Q/4KV full-attention layers) never got that
+        // recapture, so a graph taken below the MMA floor kept replaying the scalar tile
+        // after n_splits had already settled and seqlen crossed 512 / chunk 32.
+        // SPARKINFER_FAMMA6=0 restores the previous "never recapture for GQA-6" behaviour.
+        const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+        attn_graph_mode = (seqlen > 512 && mma_chunk >= 32) ? 4 : 1;
     }
     if (s.graph_ready && attn_graph_mode != s.graph_attn_mode) {
         cu(cudaGraphExecDestroy(s.cu_exec), "graph recapture destroy exec");

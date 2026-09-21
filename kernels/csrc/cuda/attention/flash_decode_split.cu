@@ -925,9 +925,24 @@ template <> struct fa_mma_block_threads<128, 16> { static constexpr int v = 256;
 // step and moves 8.66 GB per step at about half of DRAM peak -- so the freed registers go straight
 // into loads in flight. Measured on the 24Q/4KV group at ctx=262144: minb 5 -> 50.48 tok/s,
 // 4 -> 54.51, 3 -> 55.67, 2 -> 54.61 (2 drops to two blocks/SM and gives the win back).
-// Only the shape that was measured is specialized; every other instantiation keeps five.
+// Only the shapes whose shared-memory ceiling was counted are specialized; every other
+// instantiation keeps five. hd256 GQA-8 and GQA-4 were the leftover: they share this kernel's
+// 8-warp layout (fa_mma_block_threads pins 256 threads) and the same int8 planes, so five
+// blocks cannot fit there either.
+//
+//   GQA-8: 2*16*256 B planes + (16+8)*256 floats + scale tail = 34048 B. 3*34048 = 102144
+//          against 102400 B/SM -- three is the ceiling, four is 136192.
+//   GQA-4: 2*16*256 B planes + (16+4)*256 floats + scale tail = 29952 B. 3*29952 = 89856,
+//          4*29952 = 119808 -- three is the ceiling.
+//
+// __launch_bounds__(256, 5) still pinned ptxas to 51 registers for a fifth block that cannot
+// exist, the same waste #1114 closed for GQA-6 and #1122 closed for hd128 GQA-16. Asking for
+// the three that do fit is the same register trade. SPARKINFER_FAMMA=0 / SPARKINFER_FAMMA4=0
+// keep the tile kernel.
 template <int HEAD_DIM, int GQA> struct fa_mma_min_blocks { static constexpr int v = 5; };
 template <> struct fa_mma_min_blocks<256, 6> { static constexpr int v = 3; };
+template <> struct fa_mma_min_blocks<256, 8> { static constexpr int v = 3; };
+template <> struct fa_mma_min_blocks<256, 4> { static constexpr int v = 3; };
 // Muse Glimmer's 16:1 group (hd128). Same leftover #1114 closed for the 6:1 hd256 kernel: five
 // blocks cannot fit. Dynamic smem is 2*16*128 B of int8 planes plus (16+16)*128 floats plus the
 // scale tail -- 21760 B -- and 5 * 21760 > the 5090's 102400 B/SM, so FOUR is the ceiling.
