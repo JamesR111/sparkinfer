@@ -1564,7 +1564,8 @@ bool launch_prefill_attn_mma(
 template <int HEAD_DIM, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pool,
-    const void* __restrict__ v_pool_raw, const __half* __restrict__ v_scale,
+    const void* __restrict__ v_pool_raw, const __nv_bfloat16* __restrict__ v_pack,
+    const __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
     int block_size, int max_blocks_per_seq, float scale, int qld, int pld, int q_pos0) {
@@ -1828,10 +1829,16 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
             for (int ks = 0; ks < gblk; ks++) {
                 const int pb = block_table[(k0 / block_size) + ks];
                 const __nv_bfloat16* vb =
-                    v_pool_bf + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM + dt * 16;
+                    v_pack ? v_pack + (((((size_t)(k0 / block_size) + ks) * n_kv_heads + kvh)
+                                         * DTILE + dt) * 16) * 16
+                           : v_pool_bf + ((size_t)pb * block_size * n_kv_heads + kvh) * HEAD_DIM
+                                 + dt * 16;
                 fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> af;
                 fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> bf;
-                load_matrix_sync(bf, vb, KVLD);                  // V fragment: loaded once
+                // ldm has to be a compile-time constant for this load; a runtime select
+                // miscompiles the address walk.
+                if (v_pack) load_matrix_sync(bf, vb, 16);
+                else        load_matrix_sync(bf, vb, (int)KVLD);
                 #pragma unroll
                 for (int h = 0; h < RQH; h++) {
                     load_matrix_sync(af, s_p + (size_t)h * BM * pld + ks * 16, pld);
@@ -1981,6 +1988,29 @@ __global__ __launch_bounds__(GROUP_BLKS * 32) void pf_attn_mma_bf16_kernel(
     }
 }
 
+// V's wmma B operand wants 16 consecutive keys of one dim-tile. In [token][kv-head][dim]
+// those keys are KVLD elements apart, so each 32-byte row is its own sector. Repack once
+// per pass into [logical page][kv-head][d-tile][16][16], which is the fragment with ldm=16.
+// Same bytes, so every PV product is unchanged. SPARKINFER_PREFILL_ATTN_BF16_VPACK=0
+// keeps the strided load.
+__global__ void pf_bf16_vpack_kernel(const __nv_bfloat16* __restrict__ v,
+                                     const int* __restrict__ block_table,
+                                     __nv_bfloat16* __restrict__ dst,
+                                     int n_kv, int hd) {
+    const int page = (int)blockIdx.x;
+    const int kvh  = (int)blockIdx.y;
+    const int dt   = (int)threadIdx.y;
+    const int row  = (int)threadIdx.x;
+    const int pb   = block_table[page];
+    const size_t KVLD = (size_t)n_kv * hd;
+    const __nv_bfloat16* src = v + ((size_t)pb * 16 * n_kv + kvh) * hd + dt * 16
+                             + (size_t)row * KVLD;
+    __nv_bfloat16* d = dst + ((((size_t)page * n_kv + kvh) * (hd / 16) + dt) * 16 + row) * 16;
+    // 16 bf16 = 32 B. Two aligned 16 B copies; both bases are 16 B aligned.
+    *reinterpret_cast<uint4*>(d)     = *reinterpret_cast<const uint4*>(src);
+    *reinterpret_cast<uint4*>(d + 8) = *reinterpret_cast<const uint4*>(src + 8);
+}
+
 template <int HD, int GROUP_BLKS, int RQH, bool PSPLIT, bool VINT8 = false>
 static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* v_pool,
                                  const void* v_scale, const int* block_table, void* attn, int n_tokens,
@@ -2006,9 +2036,38 @@ static bool launch_attn_bf16_gqa(const void* q, const void* k_pool, const void* 
         cfg = 1;
     }
     dim3 grid((n_tokens + BM - 1) / BM, n_q_heads / RQH);
+    const __nv_bfloat16* v_pack = nullptr;
+    if constexpr (!VINT8) {
+        static int on = -1;
+        if (on < 0) {
+            const char* e = getenv("SPARKINFER_PREFILL_ATTN_BF16_VPACK");
+            on = (e && e[0] == '0') ? 0 : 1;
+        }
+        // ctx 128 is one query-tile wave and the pack does not pay for itself; it is also
+        // a scored floor. 512 is the first scored bf16 prefill (longer benches switch the
+        // KV cache to int8 and never reach this load).
+        const int n_pages = (q_pos0 + n_tokens + BM - 1) / BM;
+        if (on && n_tokens >= 512 && block_size == 16 && HD % 16 == 0 && n_pages > 0) {
+            static __nv_bfloat16* buf = nullptr;
+            static size_t cap = 0;
+            const size_t need = (size_t)n_pages * n_kv_heads * HD * BM;
+            if (need > cap) {
+                if (buf) cudaFree(buf);
+                if (cudaMalloc(&buf, need * sizeof(__nv_bfloat16)) != cudaSuccess) {
+                    buf = nullptr; cap = 0;
+                } else cap = need;
+            }
+            if (buf) {
+                pf_bf16_vpack_kernel<<<dim3(n_pages, n_kv_heads), dim3(16, HD / 16), 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(v_pool), block_table, buf,
+                    n_kv_heads, HD);
+                v_pack = buf;
+            }
+        }
+    }
     pf_attn_mma_bf16_kernel<HD, GROUP_BLKS, RQH, PSPLIT, VINT8><<<grid, GROUP_BLKS * 32, sm, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k_pool),
-        v_pool, reinterpret_cast<const __half*>(v_scale), block_table,
+        v_pool, v_pack, reinterpret_cast<const __half*>(v_scale), block_table,
         reinterpret_cast<__nv_bfloat16*>(attn), n_tokens, n_q_heads, n_kv_heads,
         block_size, max_blocks_per_seq, scale, qld, pld, q_pos0);
     // A rejected launch (e.g. smem over the device limit) enqueues nothing; peek --
